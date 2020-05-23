@@ -1,6 +1,6 @@
 # autonomous-boat-project
 Code for an autonomous rc boat which uses arduino  
-Screenshots of the boat are in my [tumblr profile](sirick93.tumblr.com)  
+Screenshots of the boat are in my [tumblr profile](https://sirick93.tumblr.com/)  
 It has a single DC motor and a single rudder for navigation, controlled but a servo motor.
 
 **Components:**
