@@ -1,3 +1,9 @@
+/*
+ * DC motor and servo motor code designed to work with a 
+ * potentiometer for testing purposes. Later we will give
+ * the digital angle to the motors with a gps algorithm
+*/
+
 #include <Servo.h>
 
 Servo myServo;
