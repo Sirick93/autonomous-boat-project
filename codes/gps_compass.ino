@@ -12,14 +12,18 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_HMC5883_U.h>
+#include <stdlib.h>
+#include <Servo.h>
 
 static const int RXPin1 = 2, TXPin1 = 3, RXPin2 = 7, TXPin2 = 8, RPin1 = 4, RPin2 = 6;
 static const uint32_t GPSBaud = 9600;
-int month, day, year, i = 0, j = 0;
-char varbuf[32];
-char sendbuf[32];
-bool received = false;
-//String post[10] = "no data";
+float gpslat, gpslon, newlat, newlon;
+double course;
+uint8_t sats, hours, mins, secs, day, month;
+uint16_t year;
+uint32_t startGetFixmS, endFixmS, i = 0, j = 0, k, angle;
+static char varbuf[32], sendbuf[32], lat_arr[10], lon_arr[10];
+bool received = false, newData = false;
 
 // Assign a Uniquej ID to the HMC5883 Compass Sensor
 Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
@@ -32,21 +36,8 @@ SoftwareSerial s1(RXPin1, TXPin1);
 // The serial connection to LoRa transmitter
 SoftwareSerial s2(RXPin2, TXPin2);
 
-void displaySensorDetails(void)
-{
-  sensor_t sensor;
-  mag.getSensor(&sensor);
-  Serial.println("------------------------------------");
-  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
-  Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
-  Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
-  Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println(" uT");
-  Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println(" uT");
-  Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println(" uT");
-  Serial.println("------------------------------------");
-  Serial.println("");
-  delay(500);
-}
+Servo myServo;
+Servo motor;
 
 void setup()
 {
@@ -54,57 +45,89 @@ void setup()
   digitalWrite(RPin1, HIGH);
   pinMode(RPin2, OUTPUT);
   digitalWrite(RPin2, HIGH);
+  
   Serial.begin(GPSBaud);
+  s1.begin(GPSBaud);
+  s2.begin(GPSBaud);
+  
+  myServo.attach(5);
+  motor.attach(9,1000,2000);
+  
   while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB port only
   }
-  s1.begin(GPSBaud);
-  s2.begin(GPSBaud);
+  Serial.println();
+  Serial.print(F(__TIME__));
+  Serial.print(F(" "));
+  Serial.println(F(__DATE__));
+  Serial.println();
+
+  sensor_t sensor;
+  mag.getSensor(&sensor);
 
   Serial.println(F("Debugging attached NEO-M8N GPS module and LoRa"));
   Serial.print(F("Using TinyGPS++ library v. ")); Serial.println(TinyGPSPlus::libraryVersion());
   Serial.println();
-  displaySensorDetails();
+  startGetFixmS = millis();
 }
 
 void loop()
 {
   s1.listen();
-  Serial.println("Data from gps:");
   delay(1000);
-  // This sketch displays information every time a new sentence is correctly encoded from the GPS Module.
-  while (s1.available() > 0) {
-    if (gps.encode(s1.read())) {
-      displayGpsInfo();
-      Serial.println("Data to feather:");
-      //post = day + "/" + month + "/" + year;
-      //s2.println(post);
-      s2.print("<");
-      s2.print(day);
-      s2.print("/");
-      s2.print(month);
-      s2.print("/");
-      s2.print(year);
-      s2.print(">");
-      break;
-    }
+  Serial.println("Data from gps:");
+  if (gpsWaitFix(5))
+  {
+    Serial.println();
+    Serial.print(F("Fix time "));
+    Serial.print(endFixmS - startGetFixmS);
+    Serial.println(F("mS"));
+
+    gpslat = gps.location.lat();
+    gpslon = gps.location.lng();
+    sats = gps.satellites.value();
+    hours = gps.time.hour();
+    mins = gps.time.minute();
+    secs = gps.time.second();
+    day = gps.date.day();
+    month = gps.date.month();
+    year = gps.date.year();
+
+    printGPSfix();
+    Serial.println("Sending data to feather...");
+    s2.print("<");
+    s2.print(gpslat, 6);
+    s2.print(" ");
+    s2.print(gpslon, 6);
+    s2.print(" ");
+    s2.print("Sat: ");
+    s2.print(sats);
+    s2.print(">");
+    startGetFixmS = millis();    //have a fix, next thing that happens is checking for a fix, so restart timer
   }
+  else
+  {
+    Serial.println();
+    Serial.print(F("Timeout - No GPS Fix "));
+    Serial.print( (millis() - startGetFixmS) / 1000 );
+    Serial.println(F("s"));
+  }
+
   s2.listen();
   Serial.println("Checking for new coordinates...");
   delay(1000);
   static bool reading = false;
   while (s2.available() > 0 && received == false) {
     varbuf[i] = s2.read();
-    if (varbuf[i] == 60) {
+    if (varbuf[i] == '<') {
       reading = true;
     }
     if (reading) {
-      if (varbuf[i] != 13 && varbuf[i] != 60 && varbuf[i] != 62) {
-        Serial.write(varbuf[i]);
-        //sendbuf[j] = varbuf[i];
-        //j++;
+      if (varbuf[i] != '<' && varbuf[i] != '>') {
+        sendbuf[j] = varbuf[i];
+        j++;
       }
-      if (varbuf[i] == 62) {
+      if (varbuf[i] == '>') {
         received = true;
         reading = false;
         break;
@@ -113,72 +136,110 @@ void loop()
     }
   }
   if (received) {
-    Serial.println();
+    //s2.print("<Coords received!>");
+    for (k = 0; k < 9; k++) {
+    lat_arr[k] = sendbuf[k];
+    lon_arr[k] = sendbuf[10+k];
+    }
+    newlat = atof(lat_arr);
+    newlon = atof(lon_arr);
+    Serial.print(newlat, 6);
+    Serial.print(" ");
+    Serial.println(newlon, 6);
+    //Serial.println(sendbuf);
+    //Serial.println(j);
+    if (newData) { //if gps data received, calculate bearing
+    course = gps.courseTo(gpslat, gpslon, newlat, newlon); // returns course in degrees (North=0, West=270) from position 1 to position 2,
+    //angle = map(course, 0, 360, 0, 180); // converts bearing to servo degrees
+    //myServo.write(angle);
+    //motor.write(100);
+    Serial.println("Bearing: ");
+    Serial.print(gps.cardinal(course));
+    }
     received = false;
     i = 0;
+    j = 0;
+    memset(sendbuf, 0, sizeof(sendbuf));
+    memset(varbuf, 0, sizeof(varbuf));
   }
   else {
     Serial.println("No message");
   }
-  delay(1000);
 }
 
-void displayGpsInfo()
+bool gpsWaitFix(uint16_t waitSecs)
 {
-  // Prints the location if lat-lng information was recieved
-  Serial.print(F("Location: "));
-  if (gps.location.isValid())
+  //waits a specified number of seconds for a fix, returns true for good fix
+  uint32_t endwaitmS;
+  uint8_t GPSchar;
+
+  Serial.print(F("Wait GPS Fix "));
+  Serial.print(waitSecs);
+  Serial.println(F(" seconds"));
+
+  endwaitmS = millis() + (waitSecs * 1000);
+
+  while (millis() < endwaitmS)
   {
-    Serial.print(gps.location.lat(), 6);
-    Serial.print(F(","));
-    Serial.print(gps.location.lng(), 6);
-  }
-  // prints invalid if no information was recieved in regards to location.
-  else
-  {
-    Serial.print(F("INVALID"));
+    if (s1.available() > 0)
+    {
+      GPSchar = s1.read();
+      gps.encode(GPSchar);
+    }
+    if (gps.location.isUpdated() && gps.date.isUpdated())
+    {
+      endFixmS = millis();  //record the time when we got a GPS fix
+      newData = true;
+      return true;
+    }
   }
 
-  Serial.print(F("  Date/Time: "));
-  // prints the recieved GPS module date if it was decoded in a valid response.
-  if (gps.date.isValid())
+  return false;
+}
+
+
+void printGPSfix()
+{
+  Serial.print(F("New GPS Fix "));
+
+  Serial.print(F("Lat,"));
+  Serial.print(gpslat, 6);
+  Serial.print(F(",Lon,"));
+  Serial.print(gpslon, 6);
+  Serial.print(F("m,Sats,"));
+  Serial.print(sats);
+  Serial.print(F(",Time,"));
+
+  if (hours < 10)
   {
-    month = gps.date.month();
-    day = gps.date.day();
-    year = gps.date.year();
-    Serial.print(day);
-    Serial.print(F("/"));
-    Serial.print(month);
-    Serial.print(F("/"));
-    Serial.print(year);
-  }
-  else
-  {
-    // prints invalid otherwise.
-    Serial.print(F("INVALID DATE"));
+    Serial.print(F("0"));
   }
 
-  Serial.print(F(" "));
-  // prints the recieved GPS module time if it was decoded in a valid response.
-  if (gps.time.isValid())
+  Serial.print(hours);
+  Serial.print(F(":"));
+
+  if (mins < 10)
   {
-    if (gps.time.hour() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.hour());
-    Serial.print(F(":"));
-    if (gps.time.minute() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.minute());
-    Serial.print(F(":"));
-    if (gps.time.second() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.second());
-    Serial.print(F("."));
-    if (gps.time.centisecond() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.centisecond());
+    Serial.print(F("0"));
   }
-  else
+
+  Serial.print(mins);
+  Serial.print(F(":"));
+
+  if (secs < 10)
   {
-    // Print invalid otherwise.
-    Serial.print(F("INVALID TIME"));
+    Serial.print(F("0"));
   }
+
+  Serial.print(secs);
+  Serial.print(F(",Date,"));
+
+  Serial.print(day);
+  Serial.print(F("/"));
+  Serial.print(month);
+  Serial.print(F("/"));
+  Serial.print(year);
+
   Serial.println();
   if (mag.begin())
   {
