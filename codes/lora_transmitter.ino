@@ -102,6 +102,7 @@ void loop()
       Serial.println("Receive failed");
     }
   }
+  memset(recbuf, 0, sizeof(recbuf));
   static bool reading = false;
   while (ss.available() > 0 && received == false) {
     varbuf[i] = ss.read();
@@ -135,5 +136,7 @@ void loop()
     received = false;
     i = 0;
     j = 0;
+    memset(sendbuf, 0, sizeof(sendbuf));
+    memset(varbuf, 0, sizeof(varbuf));
   }
 }
