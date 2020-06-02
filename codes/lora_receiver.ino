@@ -85,12 +85,14 @@ void loop()
       Serial.println((char*)buf);
       Serial.print("RSSI: ");
       Serial.println(rf95.lastRssi(), DEC);
+      digitalWrite(LED, LOW);
     }
     else
     {
       Serial.println("Receive failed");
     }
   }
+  memset(buf, 0, sizeof(buf));
   static bool reading = false;
   while (Serial.available() > 0 && received == false) {
     inputbuf[i] = Serial.read();
@@ -121,5 +123,7 @@ void loop()
     received = false;
     i = 0;
     j = 0;
+    memset(sendbuf, 0, sizeof(sendbuf));
+    memset(inputbuf, 0, sizeof(inputbuf));
   }
 }
