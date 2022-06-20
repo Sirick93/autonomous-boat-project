@@ -15,35 +15,44 @@
 
 #include <TinyGPS++.h> //library for gps
 #include <Wire.h> //library for data transfering
-#include <Adafruit_Sensor.h> //library for magnetometer
-#include <Adafruit_HMC5883_U.h> //library for magnetometer
+#include "I2Cdev.h" //library for magnetometer
+#include "AK8975.h"  //library for magnetometer
+#include "MPU6050.h" //library for MPU6050 module 9-axis
 #include <stdlib.h>
 #include <Servo.h> //library for servo motor
 
-
+int volsensor_pin = A15;
+//two resistors 30k and 7.5k
+float R1 = 30000, R2 = 7500;
+int volt_value = 0;
+float correctionfactor = .2, vin = 0.0, vout;
+char error;
+const int relay_pin = 4, LED1 = 46, LED2 = 44, LED3 = 47;
+int16_t mx, my, mz;
 static const int OPin1 = 22, OPin2 = 23, OPin3 = 24;
 static const uint32_t GPSBaud = 9600;
 float gpslat, gpslon, newlat[32], newlon[32];
 double targetcourse, offcourse, targetbearing, offbearing, distance, target_opposite, off_opposite, heading_error, course_error;
 uint8_t sats, hours, mins, secs, day, month, mode = 0, size;
 uint16_t year;
-uint32_t  start, end, time, endgpsdatawaitmS, startGetFixmS, startloop, endloop, looptime, endFixmS, i = 0, j = 0, c = 0, active = 0, k, p = 0;
+uint32_t  start, end, time, endgpsdatawaitmS, startGetFixmS, volt_time_start, volt_time_end, startloop, endloop, looptime, endFixmS, i = 0, j = 0, c = 0, active = 0, k, p = 0;
 static char varbuf[32], sendbuf[32], lat_arr[10], lon_arr[10];
 bool received = false, newData = false, gottarget = false , done = false;
-float turn, heading_propotional, heading_angle, h_kp = 0.9, course_propotional, course_angle, c_kp = 0.7;
+static bool reading = false;
+float turn, heading_propotional, heading_angle, h_kp = 0.3, course_propotional, course_angle, c_kp = 0.2, kd=0.1;
 float headingDegrees;
 float M_B[3]
-{ -53.221147, -0.513732,  -100.136661};
+{10.681202,108.656482,-118.997354};
 
 float M_Ainv[3][3]
-{ {  0.961188,  0.007866, -0.005464},
-  {  0.007866,  0.955600,  -0.002406},
-  { -0.005464,  -0.002406,  0.755887}
+{ {0.306686,0.002520,-0.001685},
+  {0.002520,0.302563,-0.002776},
+  {-0.001685,-0.002776,0.250931}
 };
 float Mxyz[3], temp[3];
 
-// Assign a Uniquej ID to the HMC5883 Compass Sensor
-Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+AK8975 mag(0x0C); 
+MPU6050 accelgyro; // address = 0x68, the default, on MPU6050 EVB
 
 // The TinyGPS++ object
 TinyGPSPlus gps;
@@ -61,13 +70,24 @@ void setup()
   digitalWrite(OPin2, HIGH);
   pinMode(OPin3, OUTPUT);
   digitalWrite(OPin3, HIGH);
-
+  //relay pin
+  pinMode(relay_pin, OUTPUT);
+  //led pins
+  pinMode(LED1, OUTPUT);
+  digitalWrite(LED1, HIGH);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  //voltage sensor pin
+  pinMode(volsensor_pin, INPUT);
+  
   //Serial.begin(GPSBaud);
   // The serial connection to the NEO-M8N GPS module
   Serial3.begin(9600);
   // The serial connection to LoRa transmitter
   Serial2.begin(GPSBaud);
-
+  
+  Wire.begin();
+  
   myServo.attach(2);
   motor.attach(3, 1000, 2000);
   //motor init
@@ -77,19 +97,22 @@ void setup()
   while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB port only
   }
-
+  
   //mag init
-  if (!mag.begin())
+  accelgyro.initialize();
+  accelgyro.setI2CBypassEnabled(true);
+  mag.initialize();
+  if (!mag.testConnection())
   {
     /* There was a problem detecting the HMC5883 ... check your connections */
-    Serial2.println("<Magnetometer fail!>");
+    error = "<Magnetometer fail!>";
     while (1);
   }
-  sensor_t sensor;
-  mag.getSensor(&sensor);
 
   startGetFixmS = millis();
   endgpsdatawaitmS = millis() + 5000;
+  volt_time_start = millis();
+  volt_time_end = millis() + 60000;
 }
 
 void loop()
@@ -116,12 +139,8 @@ void loop()
       }
     }
     if (received) {
-
-      //val = atof(sendbuf);
-      //Serial.println(sendbuf);
       if (strcmp(sendbuf, "go1") == 0) {
         motor.write(40);
-        //Serial.println("success!");
       }
       else if (strcmp(sendbuf, "go2") == 0) {
         motor.write(80);
@@ -160,15 +179,17 @@ void loop()
       memset(sendbuf, 0, sizeof(sendbuf));
       memset(varbuf, 0, sizeof(varbuf));
     }
-    else {
-      //Serial.println("No message");
-    }
   }
   else {
-    startloop = millis();
-    //Serial.println("Data from gps:");
+    //startloop = millis();
+    volt_value = analogRead(volsensor_pin);
+    vout = (volt_value*5)/1023.0;
+    vin = vout/(R2/(R1+R2));
+    vin = vin - correctionfactor;
+
     if (gpsWaitFix(5))
     {
+      digitalWrite(LED2, HIGH);
       getCompassInfo();
       //Serial.println();
       //Serial.print(F("Fix time "));
@@ -194,6 +215,7 @@ void loop()
         if (distance <= 5) {
           if (active != c - 1) { //if there is next target keep going. If not stop.
             //motor.write(80);
+            digitalWrite(LED3, HIGH);
             active++;
             distance = gps.distanceBetween(gpslat,  gpslon, newlat[active], newlon[active]); // returns distance in meters. Divide by 1000 for km
             targetcourse = gps.courseTo(gpslat,  gpslon, newlat[active], newlon[active]); // returns course in degrees (North=0, West=270) from position 1 to position 2
@@ -212,11 +234,19 @@ void loop()
             Serial2.println(gps.cardinal(targetcourse));
             Serial2.print(">");
             delay(100);
+            digitalWrite(LED3, LOW);
           }
           else {
             Serial2.print("<Target reached! Stopping!>");
+            memset(newlat, 0, sizeof(newlat));
+            memset(newlon, 0, sizeof(newlon));
+            turn=0;
+            c = 0;
+            active = 0;
+            myServo.write(90);
             motor.write(0);
             gottarget = false;
+            done=false;
           }
         }
         //course which is away from the target course
@@ -227,7 +257,7 @@ void loop()
             if (headingDegrees >= target_opposite) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse<targetcourse) { //done //unrealistic
+                if (offcourse<targetcourse) { //done *
                     heading_error=target_opposite-headingDegrees+180;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -235,12 +265,12 @@ void loop()
                     course_error=targetcourse-offcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
                 if (offcourse >= targetcourse) { //done
                   heading_error = target_opposite - headingDegrees + 180;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = offcourse-targetcourse;
                   course_propotional = c_kp * course_error;
@@ -250,42 +280,42 @@ void loop()
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (headingDegrees < target_opposite) { //done
+                if (offcourse < target_opposite) { //done
                     heading_error= headingDegrees-target_opposite;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
-                    turn=90-heading_angle;
+                    turn=90+heading_angle;
                     course_error=target_opposite-offcourse+180;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
+                    turn=turn+course_angle;
                   }
-                if (headingDegrees >= target_opposite) { //done
+                if (offcourse >= target_opposite) {  //done *
                   heading_error = target_opposite - headingDegrees + 180;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = offcourse-targetcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
-                  turn = turn + course_angle;
+                  turn = turn - course_angle;
                 }
               }
             }
             if (headingDegrees < target_opposite) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse <= targetcourse) { //done
+                if (offcourse <= targetcourse) { //done 
                   heading_error = headingDegrees-targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = targetcourse-offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn - course_angle;
                 }
-                if (offcourse>targetcourse) { //done // not reallistic
+                if (offcourse>targetcourse) { //done //*
                     heading_error = headingDegrees-targetcourse;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -293,12 +323,12 @@ void loop()
                     course_error=offcourse-targetcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
+                    turn=turn+course_angle;
                   }
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (offcourse<target_opposite) { //done //not realistic
+                if (offcourse<target_opposite) { //done //*
                     heading_error=headingDegrees-targetcourse;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -306,12 +336,12 @@ void loop()
                     course_error=offcourse-targetcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
+                    turn=turn+course_angle;
                   }
                 if (offcourse >= target_opposite) { //done
                   heading_error = headingDegrees-targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = target_opposite-offcourse+180;
                   course_propotional = c_kp * course_error;
@@ -325,7 +355,7 @@ void loop()
             if (headingDegrees < targetcourse) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse<targetcourse) { //done //not realistic
+                if (offcourse<targetcourse) { //done *
                     heading_error=targetcourse-headingDegrees;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -333,12 +363,12 @@ void loop()
                     course_error=targetcourse-offcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
                 if (offcourse >= targetcourse) { //done
                   heading_error = targetcourse-headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = offcourse-targetcourse;
                   course_propotional = c_kp * course_error;
@@ -348,7 +378,7 @@ void loop()
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (offcourse<target_opposite) { //done //not realistic
+                if (offcourse<target_opposite) { //done
                     heading_error=targetcourse-headingDegrees;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -358,15 +388,15 @@ void loop()
                     course_angle=course_propotional;
                     turn=turn+course_angle;
                   }
-                if (offcourse >= target_opposite) { //done
+                if (offcourse >= target_opposite) { // done *
                   heading_error = targetcourse-headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = target_opposite - offcourse +180;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
-                  turn = turn + course_angle;
+                  turn = turn - course_angle;
                 }
               }
             }
@@ -376,27 +406,27 @@ void loop()
                 if (offcourse <= targetcourse) { //done
                   heading_error = headingDegrees - targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = targetcourse - offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn - course_angle;
                 }
-                if (offcourse>targetcourse) { // done //not realistic
-                    heading_error = headingDegrees - targetcourse;
-                    heading_propotional=h_kp*heading_error;
-                    heading_angle=heading_propotional;
-                    turn=90-heading_angle;
-                    course_error = offcourse - targetcourse;
-                    course_propotional=c_kp*course_error;
-                    course_angle=course_propotional;
-                    turn=turn-course_angle;
-                  }
+                if (offcourse>targetcourse) { //done *
+                  heading_error = headingDegrees - targetcourse;
+                  heading_propotional=h_kp*heading_error;
+                  heading_angle=heading_propotional;
+                  turn=90-heading_angle;
+                  course_error = offcourse - targetcourse;
+                  course_propotional=c_kp*course_error;
+                  course_angle=course_propotional;
+                  turn=turn+course_angle;
+                }
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (offcourse<target_opposite) { //done not realistic
+                if (offcourse<target_opposite) { //done *
                     heading_error = headingDegrees - targetcourse;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -404,12 +434,12 @@ void loop()
                     course_error = offcourse - targetcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
+                    turn=turn+course_angle;
                   }
                 if (offcourse >= target_opposite) { //done
                   heading_error = headingDegrees - targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = target_opposite - offcourse + 180;
                   course_propotional = c_kp * course_error;
@@ -426,17 +456,17 @@ void loop()
             if (headingDegrees >= targetcourse) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse <= target_opposite) { //done //not realistic
+                if (offcourse <= target_opposite) { //done*
                   heading_error = headingDegrees - targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = abs(target_opposite - offcourse - 180);
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
-                  turn = turn - course_angle;
+                  turn = turn + course_angle;
                 }
-                if (offcourse>target_opposite) { //done 
+                if (offcourse>target_opposite) { //done
                     heading_error=headingDegrees - targetcourse;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -452,52 +482,54 @@ void loop()
                 if (offcourse <= targetcourse) { //done
                   heading_error = headingDegrees - targetcourse;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = targetcourse - offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn - course_angle;
                 }
-                if (offcourse>targetcourse) { //done //not realistic
+                if (offcourse>targetcourse) { //done *
                     heading_error=headingDegrees - targetcourse;
                     heading_propotional=h_kp*heading_error;
+
                     heading_angle=heading_propotional;
                     turn=90-heading_angle;
-                    course_error=offcourse - targetcourse;
+                    course_error=offcourse + targetcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
-                  }
+                    turn=turn + course_angle;
+                }
               }
             }
             if (headingDegrees < targetcourse) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse <= target_opposite) { //done //not realistic
+                if (offcourse <= target_opposite) { //done 
                   heading_error = targetcourse - headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = targetcourse - offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn + course_angle;
                 }
-                if (offcourse>target_opposite) { //done
+                if (offcourse>target_opposite) { //done *
                     heading_error=targetcourse - headingDegrees;
                     heading_propotional=h_kp*heading_error;
+
                     heading_angle=heading_propotional;
                     turn=90+heading_angle;
                     course_error=abs(target_opposite-offcourse-180);
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (offcourse<targetcourse) { //done //not realistic
+                if (offcourse<targetcourse) { //done *
                     heading_error=targetcourse-headingDegrees;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -505,12 +537,12 @@ void loop()
                     course_error=targetcourse-offcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
                 if (offcourse >= targetcourse) { //done
                   heading_error = targetcourse-headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = offcourse - targetcourse;
                   course_propotional = c_kp * course_error;
@@ -524,25 +556,26 @@ void loop()
             if (headingDegrees < target_opposite) {
               if (offcourse >= 0 && offcourse < 180) {
                 off_opposite = offcourse + 180;
-                if (offcourse <= target_opposite) { //done //not realistic
+                if (offcourse <= target_opposite) { //done *
                   heading_error = headingDegrees + (360 - targetcourse);
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = offcourse + (360 - targetcourse);
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
-                  turn = turn - course_angle;
+                  turn = turn + course_angle;
                 }
                 if (offcourse>target_opposite) { //done
-                     heading_error=headingDegrees + (360 - targetcourse);
-                     heading_propotional=h_kp*heading_error;
-                     heading_angle=heading_propotional;
-                     turn=90-heading_angle;
-                     course_error=target_opposite-offcourse+180;
-                     course_propotional=c_kp*course_error;
-                     course_angle=course_propotional;
-                     turn=turn-course_angle;
+                    heading_error=headingDegrees + (360 - targetcourse);
+                    heading_propotional=h_kp*heading_error;
+
+                    heading_angle=heading_propotional;
+                    turn=90-heading_angle;
+                    course_error=target_opposite-offcourse+180;
+                    course_propotional=c_kp*course_error;
+                    course_angle=course_propotional;
+                    turn=turn-course_angle;
                   }
               }
               if (offcourse >= 180 && offcourse <= 360) {
@@ -550,14 +583,14 @@ void loop()
                 if (offcourse <= targetcourse) { //done
                   heading_error = headingDegrees + (360 - targetcourse);
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 - heading_angle;
                   course_error = targetcourse - offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn - course_angle;
                 }
-                if (offcourse>targetcourse) { //done //not realistic
+                if (offcourse>targetcourse) { //done *
                     heading_error=headingDegrees + (360 - targetcourse);
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -565,7 +598,7 @@ void loop()
                     course_error=offcourse - targetcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn-course_angle;
+                    turn=turn+course_angle;
                   }
               }
             }
@@ -575,14 +608,14 @@ void loop()
                 if (offcourse < target_opposite) { //done
                   heading_error = targetcourse - headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = (360 - targetcourse) + offcourse;
                   course_propotional = c_kp * course_error;
                   course_angle = course_propotional;
                   turn = turn + course_angle;
                 }
-                if (offcourse>=target_opposite) { //done //not realistic
+                if (offcourse>=target_opposite) { //done *
                     heading_error=targetcourse - headingDegrees;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -590,12 +623,12 @@ void loop()
                     course_error=targetcourse - offcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
               }
               if (offcourse >= 180 && offcourse <= 360) {
                 off_opposite = offcourse - 180;
-                if (offcourse<targetcourse) { //not realistic
+                if (offcourse<targetcourse) { //done *
                     heading_error=targetcourse - headingDegrees;
                     heading_propotional=h_kp*heading_error;
                     heading_angle=heading_propotional;
@@ -603,12 +636,12 @@ void loop()
                     course_error=targetcourse - offcourse;
                     course_propotional=c_kp*course_error;
                     course_angle=course_propotional;
-                    turn=turn+course_angle;
+                    turn=turn-course_angle;
                   }
-                if (offcourse > targetcourse) { 
+                if (offcourse > targetcourse) { //done
                   heading_error = targetcourse - headingDegrees;
                   heading_propotional = h_kp * heading_error;
-                  heading_angle = heading_propotional;
+                  heading_angle=heading_propotional;
                   turn = 90 + heading_angle;
                   course_error = offcourse - targetcourse;
                   course_propotional = c_kp * course_error;
@@ -628,6 +661,18 @@ void loop()
         myServo.write(turn);
       }
       //printGPSfix();
+      if (millis() > volt_time_end && vin>6) {
+        Serial2.print("<");
+        Serial2.print("LiPo V: ");
+        Serial2.print(vin,4);
+        Serial2.print(">");
+        if (vin<7.6) {
+          Serial2.print("<");
+          Serial2.print("VOLT LOW!");
+          Serial2.print(">");
+        }
+        volt_time_end = millis() + 60000;
+      }
       if (millis() > endgpsdatawaitmS) { //send every 5 seconds
         //Serial.println("Sending data to feather...");
         Serial2.print("<");
@@ -655,13 +700,19 @@ void loop()
         Serial2.println(turn); // 
         Serial2.print(">");
         delay(100);
-        Serial2.print("< looptime: ");
-        Serial2.println(looptime); // 
-        Serial2.print(">");
-        delay(100);
+        //Serial2.print("< looptime: ");
+        //Serial2.println(looptime); // 
+        //Serial2.print(">");
+        //delay(100);
+        if (error!=NULL) {
+           Serial2.print(error);
+           delay(100);
+        }
         endgpsdatawaitmS = millis() + 5000;
       }
       startGetFixmS = millis();    //have a fix, next thing that happens is checking for a fix, so restart timer
+      volt_time_start = millis();
+      digitalWrite(LED2, LOW);
     }
     else
     {
@@ -670,10 +721,7 @@ void loop()
       //Serial.print( (millis() - startGetFixmS) / 1000 );
       //Serial.println(F("s"));
     }
-
-    //Serial.println("Checking for new coordinates...");
-    //delay(5000);
-    static bool reading = false;
+    
     while (Serial2.available() > 0 && received == false) {
       varbuf[i] = Serial2.read();
       if (varbuf[i] == '<') {
@@ -693,11 +741,6 @@ void loop()
       }
     }
     if (received) {
-      size = sizeof(sendbuf) / sizeof(sendbuf[0]);
-      //Serial2.print("<Size of input: ");
-      //Serial2.print(size);
-      //Serial2.print(">");
-      //delay(100);
       if (strcmp(sendbuf, "manual") == 0) {
         mode = 0;
         Serial2.print("<Manual drive set!>");
@@ -706,14 +749,21 @@ void loop()
       else if (strcmp(sendbuf, "del1") == 0) {
         if (c > 0) { //if there is target to delete
           if (c - 1 == active) { //if target is the current target
+            memset(newlat, 0, sizeof(newlat));
+            memset(newlon, 0, sizeof(newlon));
+            c = 0;
+            active = 0;
             motor.write(0);
             myServo.write(90);
             turn=0;
             gottarget = false;
+            done=false;
           }
-          newlat[c - 1] = 0.0;
-          newlon[c - 1] = 0.0;
-          c--;
+          else {
+            newlat[c - 1] = 0.0;
+            newlon[c - 1] = 0.0;
+            c--;
+          }
           Serial2.print("<Target deleted!>");
           delay(100);
         }
@@ -731,10 +781,11 @@ void loop()
         motor.write(0);
         myServo.write(90);
         gottarget = false;
+        done=false;
         Serial2.print("<Plan deleted!>");
         delay(100);
       }
-      else {
+      else if (strlen(sendbuf)==19) {
         Serial2.print("<Coords received!>");
         delay(100);
         for (k = 0; k < 9; k++) {
@@ -743,17 +794,12 @@ void loop()
         }
         newlat[c] = atof(lat_arr);
         newlon[c] = atof(lon_arr);
-        //Serial.print(newlat[c], 6);
-        //Serial.print(" ");
-        //Serial.println(newlon[c], 6);
-        //Serial.println(sendbuf);
-        //Serial.println(j);
         if (newData) { // if gps data received, calculate bearing
-          gottarget = true;
-          done = false;
-          if (active == 0) { // for the first target only
-            distance = gps.distanceBetween(gpslat,  gpslon, newlat[c], newlon[c]); // returns distance in meters. Divide by 1000 for km
-            targetcourse = gps.courseTo(gpslat,  gpslon, newlat[c], newlon[c]); // returns course in degrees (North=0, West=270) from position 1 to position 2,
+          if (active == 0 && c==0) { // for the first target only
+            done = false;
+            gottarget = true;
+            distance = gps.distanceBetween(gpslat,  gpslon, newlat[active], newlon[active]); // returns distance in meters. Divide by 1000 for km
+            targetcourse = gps.courseTo(gpslat,  gpslon, newlat[active], newlon[active]); // returns course in degrees (North=0, West=270) from position 1 to position 2,
             Serial2.print("<");
             Serial2.print("Distance to target: ");
             Serial2.print(distance);
@@ -764,29 +810,28 @@ void loop()
             Serial2.print(targetcourse);
             Serial2.print(">");
             delay(100);
-            Serial2.print("<");
-            Serial2.print(" GPS Bearing(course): ");
-            Serial2.println(gps.cardinal(targetcourse));
-            Serial2.print(">");
-            delay(100);
+            //Serial2.print("<");
+            //Serial2.print(" GPS Bearing(course): ");
+            //Serial2.println(gps.cardinal(targetcourse));
+            //Serial2.print(">");
+            //delay(100);
           }
         }
         c++;
       }
-      //else {
-      //Serial2.print("<Wrong input!>");
-      //}
+      else {
+        Serial2.print("<Wrong input!>");
+        delay(100);
+      }
       received = false;
       i = 0;
       j = 0;
       memset(sendbuf, 0, sizeof(sendbuf));
       memset(varbuf, 0, sizeof(varbuf));
     }
-    else {
-      //Serial.println("No message");
-    }
-    endloop = millis();
-    looptime = endloop-startloop;
+    
+    //endloop = millis();
+    //looptime = endloop-startloop;
   }
 }
 
@@ -823,19 +868,12 @@ bool gpsWaitFix(uint16_t waitSecs)
 void getCompassInfo()
 {
   /* Get a new sensor event   */
-  sensors_event_t event;
-  mag.getEvent(&event);
-  //float xMax=24.91 ,yMax=14.00,xMin=-26.55 ,yMin=0.00 ;
-
-  /* Display the results (magnetic vector values are in micro-Tesla (uT)) */
-  //Serial.print("X: "); Serial.print(event.magnetic.x); Serial.print("  ");
-  //Serial.print("Y: "); Serial.print(event.magnetic.y); Serial.print("  ");
-  //Serial.print("Z: "); Serial.print(event.magnetic.z); Serial.print("  "); Serial.println("uT");
-
+  mag.getHeading(&mx, &my, &mz);
+  
   // get magnetometer data
-  Mxyz[0] = event.magnetic.x;
-  Mxyz[1] = event.magnetic.y;
-  Mxyz[2] = event.magnetic.z;
+  Mxyz[0] = mx;
+  Mxyz[1] = my;
+  Mxyz[2] = mz;
 
   //apply mag offsets (bias) and scale factors from Magneto
   for (int i = 0; i < 3; i++)
@@ -848,24 +886,15 @@ void getCompassInfo()
 
   // Hold the module so that Z is pointing 'up' and you can measure the heading with x&y
   // Calculate heading when the magnetometer is level, then correct for signs of axis.
-  float heading = atan2(Mxyz[1], Mxyz[0]);
+  float heading = atan2((double)Mxyz[1], (double)Mxyz[0]) * 180.0/3.14159265 + 180;
 
   // Once you have your heading, you must then add your 'Declination Angle', which is the 'Error' of the magnetic field in your location.
   // Find yours here: http://www.magnetic-declination.com/
   float declinationAngle = 0.078;
   heading += declinationAngle;
 
-  // Correct for when signs are reversed.
-  if (heading < 0)
-    heading += 2 * PI;
-
-  // Check for wrap due to addition of declination.
-  if (heading > 2 * PI)
-    heading -= 2 * PI;
-
-  // Convert radians to degrees for readability.
-  headingDegrees = heading * 180 / M_PI;
-
-  //Serial.print("Heading (degrees): "); Serial.println(headingDegrees);
-  //delay(1000);
+  while (heading < 0) heading += 360;
+  while (heading > 360) heading -= 360;
+  
+  headingDegrees = heading;
 }
